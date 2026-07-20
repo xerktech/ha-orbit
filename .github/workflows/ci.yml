@@ -42,5 +42,8 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
-          # A brand-new domain isn't in home-assistant/brands yet.
-          ignore: brands
+          # brands: a brand-new domain isn't in home-assistant/brands yet.
+          # license: HACS reads the license from GitHub's repo metadata, which
+          #   is derived from the DEFAULT branch. On a PR whose LICENSE isn't on
+          #   main yet this is a false negative; it passes once merged.
+          ignore: brands license
