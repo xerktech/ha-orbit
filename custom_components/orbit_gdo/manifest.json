@@ -1,0 +1,12 @@
+{
+  "domain": "orbit_gdo",
+  "name": "Orbit Garage Door Opener (Skylink)",
+  "codeowners": ["@xerhab"],
+  "config_flow": true,
+  "documentation": "https://github.com/xerhab/ha-orbit",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/xerhab/ha-orbit/issues",
+  "requirements": ["paho-mqtt>=1.6.1"],
+  "version": "0.1.0"
+}
