@@ -1,0 +1,40 @@
+[project]
+name = "ha-orbit"
+version = "0.1.0"
+description = "Home Assistant integration for Skylink Orbit Wi-Fi garage door openers"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+
+[tool.uv]
+# There is no importable "ha-orbit" package to build — the integration lives in
+# custom_components/ and is unit-tested via sys.path. Don't try to build a wheel.
+package = false
+
+[dependency-groups]
+# Dev/test only. The integration itself declares runtime deps in manifest.json.
+dev = [
+    # aioresponses 0.7.x does not yet support aiohttp's 3.14 ClientResponse
+    # signature; cap aiohttp until it does.
+    "aiohttp>=3.9,<3.14",
+    "aioresponses>=0.7.6",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
+# The custom_components tree follows Home Assistant's own conventions; keep the
+# ruleset focused on real defects rather than HA-core house style.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components", "orbitclient"]

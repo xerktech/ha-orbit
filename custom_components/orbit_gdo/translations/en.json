@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Orbit Garage Door Opener",
+        "description": "Sign in with your Skylink Orbit Home account.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "base_url": "API base URL (advanced)",
+          "mqtt_host": "Realtime MQTT host (advanced)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Orbit",
+        "description": "Your Orbit credentials are no longer valid. Sign in again.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Could not reach the Orbit cloud service.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This Orbit account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Orbit options",
+        "data": {
+          "enable_realtime": "Enable realtime push updates (MQTT)"
+        },
+        "data_description": {
+          "enable_realtime": "When off, state is refreshed by polling only."
+        }
+      }
+    }
+  },
+  "entity": {
+    "light": {
+      "opener_light": {
+        "name": "Opener light"
+      }
+    },
+    "binary_sensor": {
+      "obstruction": {
+        "name": "Obstruction"
+      }
+    }
+  }
+}
