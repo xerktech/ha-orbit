@@ -1,164 +1,275 @@
-"""Unit tests for orbitclient.client (network mocked with aioresponses)."""
+"""Client tests: REST signing/login via aioresponses, MQTT via a fake transport."""
 
 from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
 
 import pytest
 from aioresponses import aioresponses
 
-from orbitclient import OrbitAuthError, OrbitClient
-from orbitclient.models import DoorState, OrbitDevice
+from orbitclient import (
+    DoorState,
+    OrbitAuthError,
+    OrbitCannotConnect,
+    OrbitClient,
+    OrbitCommandError,
+    OrbitTimeout,
+    const,
+)
+from orbitclient.client import parse_api_body, sign
 
-BASE = "https://api.test"
-LOGIN = f"{BASE}/v1/auth/login"
-DEVICES = f"{BASE}/v1/devices"
+API = re.compile(r"^https://iot\.skyhm\.net:8444/skylinkhub_crm/skyhm_api_s\.jsp.*$")
+ACC = "8000000001"
+HUB = {
+    "hub_id": "HUB1",
+    "hub_name": "Single Door",
+    "type": "GDO",
+    "online": True,
+    "reported": {"mdev": {"door": 4, "rssi": -60}},
+}
 
 
-def make_client(session, **kwargs) -> OrbitClient:
-    return OrbitClient(
-        "user@example.com", "secret", session=session, base_url=BASE, **kwargs
+class FakeTransport:
+    """In-memory broker: records publishes, answers /get with a hub list."""
+
+    def __init__(self, hubs=None, *, answer_get=True):
+        self.hubs = hubs if hubs is not None else [HUB]
+        self.answer_get = answer_get
+        self.published: list[tuple[str, dict]] = []
+        self.topics: list[str] = []
+        self.username = self.password = None
+        self._on_message = None
+        self.connected = False
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+    async def async_connect(
+        self, *, username, password, topics, on_message, on_connect
+    ):
+        self.username, self.password, self.topics = username, password, topics
+        self._on_message = on_message
+        self.connected = True
+
+    async def async_publish(self, topic, payload):
+        self.published.append((topic, json.loads(payload)))
+        if topic.endswith("/get") and self.answer_get:
+            body = json.dumps({"data": self.hubs}).encode()
+            asyncio.get_running_loop().call_soon(
+                self._on_message, f"skylink/things/client/{ACC}/get/result", body
+            )
+
+    async def async_disconnect(self):
+        self.connected = False
+
+    def push(self, data):
+        self._on_message(
+            f"skylink/things/client/{ACC}/update/result",
+            json.dumps({"data": data}).encode(),
+        )
+
+
+def _login_ok(m):
+    m.post(
+        API,
+        # Byte-for-byte shape of a real reply, incl. the invalid "result":00.
+        body='\n\r\n{"result":00,"message":"Success","acc_no":"'
+        + ACC
+        + '","alias_name":"Test User"}',
     )
 
 
-async def test_login_caches_token_and_authorizes(session):
+def _client(session, transport):
+    return OrbitClient(
+        " user@example.com ", "pw", session=session, transport_factory=lambda: transport
+    )
+
+
+# ---- REST -------------------------------------------------------------------
+
+
+def test_sign_matches_app_algorithm():
+    expected = hashlib.md5(
+        b"1700000000000+act_login+a@b.c+8uHDSF77ueRmLlKkl67"
+    ).hexdigest()
+    assert sign("1700000000000", "act_login", "a@b.c") == expected
+
+
+def test_parse_api_body_fixes_invalid_result_literal():
+    assert parse_api_body('\n{"result":00,"x":1}\n') == {"result": 0, "x": 1}
+
+
+async def test_login_sends_signed_request(session):
     with aioresponses() as m:
-        m.post(
-            LOGIN,
-            payload={"access_token": "tok123", "user_id": "u1", "expires_in": 3600},
+        _login_ok(m)
+        client = _client(session, FakeTransport())
+        account = await client.async_login()
+        assert account.acc_no == ACC and account.alias_name == "Test User"
+
+        ((key, calls),) = m.requests.items()
+        assert key[1].query["cmd"] == "act_login"
+        headers = calls[0].kwargs["headers"]
+        body = json.loads(calls[0].kwargs["data"])
+        assert body["username"] == "user@example.com"  # stripped
+        assert body["app_sys"] == "gcm" and body["app_brand"] == "00"
+        assert headers["REQ-CMD"] == "act_login"
+        assert headers["REQ-DATA"] == "user@example.com"
+        assert headers["REQ-SIGNATURE"] == sign(
+            headers["REQ-TIMESTAMP"], "act_login", "user@example.com"
         )
-        m.get(DEVICES, payload={"devices": [{"id": "d1", "door": "closed"}]})
 
-        client = make_client(session)
-        token = await client.async_login()
-        assert token.access_token == "tok123"
-        assert client.user_id == "u1"
-        assert client.is_authenticated
 
+async def test_login_rejected_is_auth_error(session):
+    with aioresponses() as m:
+        m.post(API, body='{"result":11,"message":"Login Name Does Not Exist"}')
+        with pytest.raises(OrbitAuthError, match="Does Not Exist"):
+            await _client(session, FakeTransport()).async_login()
+
+
+async def test_bad_signature_is_connect_error(session):
+    with aioresponses() as m:
+        m.post(API, body='{"result":25,"message":"Invalid Request Signature"}')
+        with pytest.raises(OrbitCannotConnect):
+            await _client(session, FakeTransport()).async_login()
+
+
+async def test_http_error_is_connect_error(session):
+    with aioresponses() as m:
+        m.post(API, status=502)
+        with pytest.raises(OrbitCannotConnect):
+            await _client(session, FakeTransport()).async_login()
+
+
+# ---- MQTT -------------------------------------------------------------------
+
+
+async def test_connect_and_get_devices(session):
+    t = FakeTransport()
+    with aioresponses() as m:
+        _login_ok(m)
+        client = _client(session, t)
         devices = await client.async_get_devices()
-        assert [d.device_id for d in devices] == ["d1"]
+    assert t.username == ACC and t.password == "pw"
+    assert t.topics == [
+        f"skylink/things/client/{ACC}/get/result",
+        f"skylink/things/client/{ACC}/update/result",
+    ]
+    assert t.published == [(f"skylink/things/client/{ACC}/get", {})]
+    assert devices["HUB1"].door_state is DoorState.CLOSED
 
-    # The devices request must carry the bearer token from login.
-    devices_calls = m.requests[("GET", _url(DEVICES))]
-    assert devices_calls[0].kwargs["headers"]["Authorization"] == "Bearer tok123"
 
-
-async def test_login_invalid_credentials_raises_auth(session):
+async def test_get_devices_timeout(session):
+    t = FakeTransport(answer_get=False)
     with aioresponses() as m:
-        m.post(LOGIN, status=401)
-        client = make_client(session)
-        with pytest.raises(OrbitAuthError):
-            await client.async_login()
-
-
-async def test_get_devices_parses_bare_list(session):
-    with aioresponses() as m:
-        m.post(LOGIN, payload={"access_token": "t"})
-        m.get(
-            DEVICES,
-            payload=[
-                {"id": "a", "door": "open", "light": True},
-                {"id": "b", "door": "closed"},
-            ],
+        _login_ok(m)
+        client = OrbitClient(
+            "u", "p", session=session, timeout=0.05, transport_factory=lambda: t
         )
-        client = make_client(session)
-        devices = await client.async_get_devices()
-
-    by_id = {d.device_id: d for d in devices}
-    assert by_id["a"].door_state is DoorState.OPEN
-    assert by_id["a"].light_on is True
-    assert by_id["b"].door_state is DoorState.CLOSED
+        with pytest.raises(OrbitTimeout):
+            await client.async_get_devices()
 
 
-async def test_send_command_posts_verb(session):
+async def _ready(session, t):
     with aioresponses() as m:
-        m.post(LOGIN, payload={"access_token": "t"})
-        m.post(f"{BASE}/v1/devices/d1/command", status=204)
-        client = make_client(session)
-        await client.async_open_door("d1")
-
-    call = m.requests[("POST", _url(f"{BASE}/v1/devices/d1/command"))][0]
-    assert call.kwargs["json"] == {"command": "open"}
+        _login_ok(m)
+        client = _client(session, t)
+        await client.async_get_devices()
+    t.published.clear()
+    return client
 
 
-async def test_light_command_off(session):
-    with aioresponses() as m:
-        m.post(LOGIN, payload={"access_token": "t"})
-        m.post(f"{BASE}/v1/devices/d1/command", status=200, payload={"ok": True})
-        client = make_client(session)
-        await client.async_set_light("d1", False)
-
-    call = m.requests[("POST", _url(f"{BASE}/v1/devices/d1/command"))][0]
-    assert call.kwargs["json"] == {"command": "light_off"}
+def _cmds(t):
+    return [p["data"]["desired"]["mdev"]["ctrlgdo"]["cmd"] for _, p in t.published]
 
 
-async def test_expired_session_triggers_relogin_and_retry(session):
-    with aioresponses() as m:
-        # First login, then a 401 on devices, then re-login, then success.
-        m.post(LOGIN, payload={"access_token": "old", "user_id": "u1"})
-        m.get(DEVICES, status=401)
-        m.post(LOGIN, payload={"access_token": "new", "user_id": "u1"})
-        m.get(DEVICES, payload={"devices": [{"id": "d1", "door": "open"}]})
-
-        client = make_client(session)
-        devices = await client.async_get_devices()
-
-    assert [d.device_id for d in devices] == ["d1"]
-    # Two login calls happened (initial + re-auth after 401).
-    assert len(m.requests[("POST", _url(LOGIN))]) == 2
+async def test_push_updates_and_notifies(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    seen = []
+    client.on_update = seen.append
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 0}}})
+    assert client.devices["HUB1"].door_state is DoorState.OPENING
+    assert seen and seen[-1].device_id == "HUB1"
 
 
-class _FakeTransport:
-    """Realtime transport that immediately replays one device on connect."""
-
-    def __init__(self, device: OrbitDevice) -> None:
-        self._device = device
-        self.connected = False
-        self.disconnected = False
-
-    async def async_connect(self, *, user_id, on_device):
-        self.connected = True
-        await on_device(self._device)
-
-    async def async_disconnect(self):
-        self.disconnected = True
+async def test_command_payload_shape(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    await client.async_open_door("HUB1")
+    ((topic, payload),) = t.published
+    assert topic == f"skylink/things/client/{ACC}/desire"
+    assert payload["data"]["hub_id"] == "HUB1"
+    ctrl = payload["data"]["desired"]["mdev"]["ctrlgdo"]
+    assert ctrl["cmd"] == const.CTRL_PRESS and ctrl["ts"].isdigit()
 
 
-async def test_realtime_delivers_device_to_callback(session):
-    pushed = _FakeTransport(OrbitDevice.from_dict({"id": "d1", "door": "opening"}))
-    received: list[OrbitDevice] = []
-
-    with aioresponses() as m:
-        m.post(LOGIN, payload={"access_token": "t", "user_id": "u1"})
-        client = make_client(session, transport_factory=lambda **_: pushed)
-        await client.async_login()
-        await client.async_start_realtime(lambda d: received.append(d) or None)
-
-    assert pushed.connected
-    assert len(received) == 1
-    assert received[0].door_state is DoorState.OPENING
-
-    await client.async_stop_realtime()
-    assert pushed.disconnected
+async def test_open_close_are_idempotent(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    await client.async_close_door("HUB1")  # already closed
+    assert t.published == []
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 1}}})
+    await client.async_open_door("HUB1")  # already open
+    assert t.published == []
+    await client.async_close_door("HUB1")
+    assert _cmds(t) == [0]
 
 
-class _BrokenTransport:
-    async def async_connect(self, *, user_id, on_device):
-        raise ConnectionError("mqtt down")
-
-    async def async_disconnect(self):
-        pass
-
-
-async def test_realtime_failure_is_non_fatal(session):
-    with aioresponses() as m:
-        m.post(LOGIN, payload={"access_token": "t", "user_id": "u1"})
-        client = make_client(session, transport_factory=lambda **_: _BrokenTransport())
-        await client.async_login()
-        # Must not raise even though the transport connect fails.
-        await client.async_start_realtime(lambda d: None)
+async def test_stopped_door_direction(session):
+    """Real hardware: from STOPPED a press reverses the last direction."""
+    t = FakeTransport()
+    client = await _ready(session, t)
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 0}}})  # opening
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 2}}})  # stopped
+    with pytest.raises(OrbitCommandError):
+        await client.async_open_door("HUB1")  # a press would CLOSE it
+    assert t.published == []
+    await client.async_close_door("HUB1")
+    assert _cmds(t) == [0]
 
 
-def _url(url: str):
-    """aioresponses keys its request log by yarl.URL."""
-    from yarl import URL
+async def test_stopped_with_unknown_direction_refuses(session):
+    t = FakeTransport(hubs=[{**HUB, "reported": {"mdev": {"door": 2}}}])
+    client = await _ready(session, t)
+    for action in (client.async_open_door, client.async_close_door):
+        with pytest.raises(OrbitCommandError):
+            await action("HUB1")
+    assert t.published == []
 
-    return URL(url)
+
+async def test_opening_cannot_be_closed_without_stop(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 0}}})
+    with pytest.raises(OrbitCommandError):
+        await client.async_close_door("HUB1")
+    await client.async_stop_door("HUB1")
+    assert _cmds(t) == [0]
+
+
+async def test_stop_is_noop_when_idle(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    await client.async_stop_door("HUB1")
+    assert t.published == []
+
+
+async def test_light_on_off(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    await client.async_set_light("HUB1", True)
+    await client.async_set_light("HUB1", False)
+    assert _cmds(t) == [3, 4]  # 4 = off confirmed on hardware
+
+
+async def test_last_motion_survives_full_resync(session):
+    t = FakeTransport()
+    client = await _ready(session, t)
+    t.push({"hub_id": "HUB1", "reported": {"mdev": {"door": 0}}})
+    t.hubs = [{**HUB, "reported": {"mdev": {"door": 2}}}]
+    await client.async_get_devices()
+    assert client.devices["HUB1"].last_motion is DoorState.OPENING

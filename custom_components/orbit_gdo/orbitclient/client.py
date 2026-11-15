@@ -1,11 +1,13 @@
-"""Async REST + realtime client for the Skylink Orbit Home cloud."""
+"""Async client for the Skylink Orbit Home cloud (REST login + MQTT)."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -18,21 +20,36 @@ from .exceptions import (
     OrbitError,
     OrbitTimeout,
 )
-from .models import OrbitDevice, OrbitToken
-from .transport import RealtimeTransport, build_default_transport
+from .models import DoorState, OrbitAccount, OrbitDevice
+from .transport import MqttTransport, build_default_transport
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Callback invoked with a device update pushed over the realtime channel.
-StatusCallback = Callable[[OrbitDevice], Awaitable[None] | None]
+#: Called (on the event loop) with the merged device after every state push.
+DeviceCallback = Callable[[OrbitDevice], None]
+
+
+def sign(timestamp: str, cmd: str, req_data: str) -> str:
+    """REQ-SIGNATURE as computed by the app: md5(ts+cmd+data+secret), "+"-joined."""
+    raw = f"{timestamp}+{cmd}+{req_data}+{const.API_SIGN_SECRET}"
+    return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 - vendor protocol
+
+
+def parse_api_body(text: str) -> dict[str, Any]:
+    """Parse a REST body. The server emits the invalid literal ``"result":00``."""
+    text = text.strip().replace('"result":00', '"result":0')
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    return data
 
 
 class OrbitClient:
     """Talks to the Orbit cloud on behalf of the Home Assistant integration.
 
-    The client owns authentication (login + transparent token refresh) and
-    exposes high-level operations. It never imports Home Assistant, so it can be
-    exercised standalone in tests.
+    Usage: :meth:`async_connect` (login + MQTT), then :meth:`async_get_devices`
+    and the command helpers. State pushes are delivered to ``on_update``.
+    Never imports Home Assistant, so it can be tested standalone.
     """
 
     def __init__(
@@ -41,257 +58,302 @@ class OrbitClient:
         password: str,
         *,
         session: aiohttp.ClientSession,
-        base_url: str = const.DEFAULT_BASE_URL,
-        mqtt_host: str = const.DEFAULT_MQTT_HOST,
-        mqtt_port: int = const.DEFAULT_MQTT_PORT,
-        mqtt_tls: bool = const.DEFAULT_MQTT_TLS,
         timeout: float = const.DEFAULT_TIMEOUT,
-        transport_factory: Callable[..., RealtimeTransport] | None = None,
+        transport_factory: Callable[[], MqttTransport] | None = None,
     ) -> None:
-        self._email = email
+        self._email = email.strip()
         self._password = password
         self._session = session
-        self._base_url = base_url.rstrip("/")
-        self._mqtt_host = mqtt_host
-        self._mqtt_port = mqtt_port
-        self._mqtt_tls = mqtt_tls
         self._timeout = timeout
         self._transport_factory = transport_factory or build_default_transport
 
-        self._token: OrbitToken | None = None
-        self._auth_lock = asyncio.Lock()
-        self._transport: RealtimeTransport | None = None
+        self.account: OrbitAccount | None = None
+        self._transport: MqttTransport | None = None
+        self._devices: dict[str, OrbitDevice] = {}
+        self._pending_get: asyncio.Future[list[dict[str, Any]]] | None = None
+        self._get_lock = asyncio.Lock()
+        self.on_update: DeviceCallback | None = None
+
+    # ---- Properties -------------------------------------------------------
 
     @property
-    def user_id(self) -> str | None:
-        """The authenticated user id, if a login has completed."""
-        return self._token.user_id if self._token else None
+    def acc_no(self) -> str | None:
+        return self.account.acc_no if self.account else None
 
     @property
-    def is_authenticated(self) -> bool:
-        return self._token is not None
+    def devices(self) -> dict[str, OrbitDevice]:
+        return self._devices
 
-    # ---- Authentication ---------------------------------------------------
+    @property
+    def is_connected(self) -> bool:
+        return self._transport is not None and self._transport.is_connected
 
-    async def async_login(self) -> OrbitToken:
-        """Authenticate and cache the resulting session token."""
-        payload = {"email": self._email, "password": self._password}
-        data = await self._raw_request(
-            "POST", const.PATH_LOGIN, json=payload, authed=False
+    # ---- REST -------------------------------------------------------------
+
+    async def async_login(self) -> OrbitAccount:
+        """Validate credentials via REST and return the account number."""
+        data = await self._api(
+            const.CMD_LOGIN,
+            self._email,
+            {
+                "username": self._email,
+                "password": self._password,
+                "app_sys": "gcm",
+                "app_brand": "00",
+                "pn_token": "",
+            },
         )
-        try:
-            token = OrbitToken.from_dict(data)
-        except KeyError as err:
-            raise OrbitAuthError(f"unexpected login response: {err}") from err
-
-        # The model stays clock-free; the client (which knows "now") derives the
-        # absolute expiry from a relative expires_in when the server sends one.
-        expires_in = data.get("expires_in") or data.get("expiresIn")
-        if token.expires_at is None and expires_in is not None:
-            try:
-                token.expires_at = time.time() + float(expires_in)
-            except (TypeError, ValueError):
-                token.expires_at = None
-        self._token = token
-        _LOGGER.debug("Logged in as user_id=%s", token.user_id)
-        return token
-
-    async def _async_ensure_token(self) -> OrbitToken:
-        """Return a valid token, logging in or refreshing as needed."""
-        async with self._auth_lock:
-            if self._token is None:
-                return await self.async_login()
-            if self._token.expires_at is not None and (
-                self._token.expires_at - time.time() < 60
-            ):
-                await self._async_refresh_or_relogin()
-            return self._token
-
-    async def _async_refresh_or_relogin(self) -> None:
-        assert self._token is not None
-        if not self._token.refresh_token:
-            self._token = None
-            await self.async_login()
-            return
-        try:
-            data = await self._raw_request(
-                "POST",
-                const.PATH_REFRESH,
-                json={"refresh_token": self._token.refresh_token},
-                authed=False,
-            )
-            refreshed = OrbitToken.from_dict(data)
-            # Carry forward the user id / mqtt creds if the refresh omits them.
-            refreshed.user_id = refreshed.user_id or self._token.user_id
-            self._token = refreshed
-        except OrbitError:
-            _LOGGER.debug("Token refresh failed; re-logging in")
-            self._token = None
-            await self.async_login()
-
-    # ---- Devices & commands ----------------------------------------------
-
-    async def async_get_devices(self) -> list[OrbitDevice]:
-        """Fetch the list of devices and their current state."""
-        data = await self._request("GET", const.PATH_DEVICES)
-        raw_list = _extract_device_list(data)
-        devices: list[OrbitDevice] = []
-        for raw in raw_list:
-            try:
-                devices.append(OrbitDevice.from_dict(raw))
-            except (KeyError, TypeError) as err:
-                _LOGGER.warning("Skipping unparseable device payload: %s", err)
-        return devices
-
-    async def async_send_command(self, device_id: str, command: str) -> None:
-        """Send a raw command verb to a device."""
-        path = const.PATH_COMMAND.format(device_id=device_id)
-        try:
-            await self._request("POST", path, json={"command": command})
-        except OrbitError:
-            raise
-        except Exception as err:  # noqa: BLE001 - normalise to our hierarchy
-            raise OrbitCommandError(str(err)) from err
-
-    async def async_open_door(self, device_id: str) -> None:
-        await self.async_send_command(device_id, const.CMD_OPEN)
-
-    async def async_close_door(self, device_id: str) -> None:
-        await self.async_send_command(device_id, const.CMD_CLOSE)
-
-    async def async_stop_door(self, device_id: str) -> None:
-        await self.async_send_command(device_id, const.CMD_STOP)
-
-    async def async_set_light(self, device_id: str, on: bool) -> None:
-        await self.async_send_command(
-            device_id, const.CMD_LIGHT_ON if on else const.CMD_LIGHT_OFF
+        result = data.get("result")
+        if result != const.RESULT_OK:
+            message = data.get("message") or "login failed"
+            if result == const.RESULT_BAD_SIGNATURE:
+                raise OrbitCannotConnect(f"API rejected request signature: {message}")
+            raise OrbitAuthError(f"{message} (result={result})")
+        acc_no = data.get("acc_no")
+        if not acc_no:
+            raise OrbitError("login succeeded but returned no account number")
+        self.account = OrbitAccount(
+            acc_no=str(acc_no), alias_name=data.get("alias_name")
         )
+        _LOGGER.debug("Orbit login OK (acc_no=%s)", acc_no)
+        return self.account
 
-    # ---- Realtime (optional push channel) --------------------------------
-
-    async def async_start_realtime(self, callback: StatusCallback) -> None:
-        """Connect the realtime channel and stream device updates to callback.
-
-        Failure here is non-fatal: the caller is expected to keep polling
-        :meth:`async_get_devices`. We log and return rather than raise so a
-        broken MQTT host never takes the whole integration down.
-        """
-        token = await self._async_ensure_token()
-        if not token.user_id:
-            _LOGGER.debug("No user_id available; realtime channel disabled")
-            return
-
-        self._transport = self._transport_factory(
-            host=self._mqtt_host,
-            port=self._mqtt_port,
-            tls=self._mqtt_tls,
-            username=token.mqtt_username or token.user_id,
-            password=token.mqtt_password or token.access_token,
-        )
-
-        async def _on_message(device: OrbitDevice) -> None:
-            result = callback(device)
-            if asyncio.iscoroutine(result):
-                await result
-
-        try:
-            await self._transport.async_connect(
-                user_id=token.user_id, on_device=_on_message
-            )
-        except Exception as err:  # noqa: BLE001 - never fatal
-            _LOGGER.info("Realtime channel unavailable, polling only: %s", err)
-            self._transport = None
-
-    async def async_stop_realtime(self) -> None:
-        if self._transport is not None:
-            await self._transport.async_disconnect()
-            self._transport = None
-
-    # ---- HTTP plumbing ----------------------------------------------------
-
-    async def _request(
-        self, method: str, path: str, *, json: dict[str, Any] | None = None
-    ) -> Any:
-        """Authenticated request with a single automatic re-auth on 401."""
-        token = await self._async_ensure_token()
-        try:
-            return await self._raw_request(
-                method, path, json=json, token=token.access_token
-            )
-        except OrbitAuthError:
-            _LOGGER.debug("Auth rejected mid-session; re-logging in and retrying")
-            self._token = None
-            token = await self._async_ensure_token()
-            return await self._raw_request(
-                method, path, json=json, token=token.access_token
-            )
-
-    async def _raw_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json: dict[str, Any] | None = None,
-        token: str | None = None,
-        authed: bool = True,
-    ) -> Any:
-        url = f"{self._base_url}{path}"
+    async def _api(
+        self, cmd: str, req_data: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        ts = str(int(time.time()) * 1000)
         headers = {
+            "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json",
-            "User-Agent": const.DEFAULT_USER_AGENT,
+            "REQ-TIMESTAMP": ts,
+            "REQ-CMD": cmd,
+            "REQ-DATA": req_data,
+            "REQ-SIGNATURE": sign(ts, cmd, req_data),
         }
-        if authed and token:
-            headers["Authorization"] = f"Bearer {token}"
-
         try:
-            async with self._session.request(
-                method,
-                url,
-                json=json,
+            async with self._session.post(
+                const.API_URL,
+                params={"cmd": cmd},
+                data=json.dumps(body),
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self._timeout),
             ) as resp:
-                return await self._handle_response(resp)
+                if resp.status >= 400:
+                    raise OrbitCannotConnect(f"API HTTP {resp.status} for {cmd}")
+                text = await resp.text()
         except TimeoutError as err:
-            raise OrbitTimeout(f"timeout calling {method} {path}") from err
+            raise OrbitTimeout(f"timeout calling {cmd}") from err
         except aiohttp.ClientError as err:
-            raise OrbitCannotConnect(f"connection error calling {path}: {err}") from err
-
-    @staticmethod
-    async def _handle_response(resp: aiohttp.ClientResponse) -> Any:
-        if resp.status in (401, 403):
-            raise OrbitAuthError(f"authentication failed ({resp.status})")
-        if resp.status >= 500:
-            raise OrbitCannotConnect(f"server error ({resp.status})")
-        if resp.status >= 400:
-            body = await _safe_text(resp)
-            raise OrbitError(f"request failed ({resp.status}): {body}")
-        if resp.status == 204 or resp.content_length == 0:
-            return {}
+            raise OrbitCannotConnect(f"connection error calling {cmd}: {err}") from err
         try:
-            return await resp.json(content_type=None)
-        except (aiohttp.ContentTypeError, ValueError):
-            # Some command endpoints reply with a bare "OK" body.
-            return {"raw": await _safe_text(resp)}
+            return parse_api_body(text)
+        except ValueError as err:
+            raise OrbitCannotConnect(
+                f"unparseable response to {cmd}: {text[:200]!r}"
+            ) from err
 
+    # ---- MQTT lifecycle ---------------------------------------------------
 
-def _extract_device_list(data: Any) -> list[dict[str, Any]]:
-    """Pull the list of device dicts out of a variety of envelope shapes."""
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    if isinstance(data, dict):
-        for key in ("devices", "data", "results", "items"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return [d for d in value if isinstance(d, dict)]
-        # A single-device object.
-        if data.get("id") or data.get("device_id") or data.get("deviceId"):
-            return [data]
-    return []
+    def _topic(self, template: str) -> str:
+        assert self.acc_no is not None
+        return template.format(acc_no=self.acc_no)
 
+    async def async_connect(self) -> None:
+        """Log in (if needed) and open the MQTT session."""
+        if self.account is None:
+            await self.async_login()
+        if self._transport is not None:
+            return
+        transport = self._transport_factory()
+        await transport.async_connect(
+            username=self.acc_no,
+            password=self._password,
+            topics=[
+                self._topic(const.TOPIC_GET_RESULT),
+                self._topic(const.TOPIC_UPDATE_RESULT),
+            ],
+            on_message=self._handle_message,
+            on_connect=self._handle_connect,
+        )
+        self._transport = transport
 
-async def _safe_text(resp: aiohttp.ClientResponse) -> str:
-    try:
-        return (await resp.text())[:500]
-    except Exception:  # noqa: BLE001
-        return "<unreadable>"
+    async def async_disconnect(self) -> None:
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            await transport.async_disconnect()
+
+    def _handle_connect(self) -> None:
+        # After a reconnect, resync the full list so no push is missed.
+        if self._devices:
+            asyncio.ensure_future(self._safe_refresh())
+
+    async def _safe_refresh(self) -> None:
+        try:
+            await self.async_get_devices()
+        except OrbitError as err:
+            _LOGGER.debug("Resync after reconnect failed: %s", err)
+
+    # ---- Inbound ------------------------------------------------------------
+
+    def _handle_message(self, topic: str, payload: bytes) -> None:
+        try:
+            message = json.loads(payload)
+        except (ValueError, TypeError):
+            _LOGGER.debug("Ignoring non-JSON MQTT payload on %s", topic)
+            return
+        if not isinstance(message, dict):
+            return
+        data = message.get("data")
+
+        if topic == self._topic(const.TOPIC_GET_RESULT):
+            hubs = (
+                [d for d in data if isinstance(d, dict)]
+                if isinstance(data, list)
+                else []
+            )
+            fut = self._pending_get
+            if fut is not None and not fut.done():
+                fut.set_result(hubs)
+            else:
+                self._replace_devices(hubs, notify=True)
+        elif topic == self._topic(const.TOPIC_UPDATE_RESULT) and isinstance(data, dict):
+            self._apply_update(data)
+
+    def _replace_devices(self, hubs: list[dict[str, Any]], *, notify: bool) -> None:
+        devices: dict[str, OrbitDevice] = {}
+        for hub in hubs:
+            try:
+                device = OrbitDevice.from_dict(hub)
+            except (KeyError, TypeError, ValueError) as err:
+                _LOGGER.warning("Skipping unparseable Orbit hub: %s", err)
+                continue
+            previous = self._devices.get(device.device_id)
+            if previous is not None and device.last_motion is None:
+                device.last_motion = previous.last_motion
+            devices[device.device_id] = device
+        self._devices = devices
+        if notify:
+            for device in devices.values():
+                self._notify(device)
+
+    def _apply_update(self, data: dict[str, Any]) -> None:
+        hub_id = data.get("hub_id")
+        existing = self._devices.get(str(hub_id)) if hub_id else None
+        if existing is None:
+            _LOGGER.debug("Push for unknown hub %s; requesting full list", hub_id)
+            asyncio.ensure_future(self._safe_refresh())
+            return
+        updated = existing.merged_with(data)
+        self._devices[updated.device_id] = updated
+        self._notify(updated)
+
+    def _notify(self, device: OrbitDevice) -> None:
+        if self.on_update is not None:
+            self.on_update(device)
+
+    # ---- Requests -----------------------------------------------------------
+
+    async def async_get_devices(self) -> dict[str, OrbitDevice]:
+        """Request and return the full device list."""
+        await self.async_connect()
+        async with self._get_lock:
+            loop = asyncio.get_running_loop()
+            self._pending_get = loop.create_future()
+            try:
+                await self._publish(self._topic(const.TOPIC_GET), "{}")
+                async with asyncio.timeout(self._timeout):
+                    hubs = await self._pending_get
+            except TimeoutError as err:
+                raise OrbitTimeout("no device list received from Orbit cloud") from err
+            finally:
+                self._pending_get = None
+        self._replace_devices(hubs, notify=False)
+        return self._devices
+
+    async def async_send_ctrl(self, device_id: str, cmd: int) -> None:
+        """Publish a raw ``ctrlgdo`` command for a hub."""
+        await self.async_connect()
+        payload = {
+            "data": {
+                "hub_id": device_id,
+                "desired": {
+                    "mdev": {
+                        "ctrlgdo": {"cmd": cmd, "ts": str(int(time.time() * 1000))}
+                    }
+                },
+            }
+        }
+        await self._publish(
+            self._topic(const.TOPIC_DESIRE), json.dumps(payload, separators=(",", ":"))
+        )
+
+    async def _publish(self, topic: str, payload: str) -> None:
+        assert self._transport is not None
+        await self._transport.async_publish(topic, payload)
+
+    # ---- High-level commands -------------------------------------------------
+
+    async def async_press_button(self, device_id: str) -> None:
+        """Equivalent to pressing the wall button (toggle)."""
+        await self.async_send_ctrl(device_id, const.CTRL_PRESS)
+
+    def press_would_move(self, device_id: str) -> DoorState | None:
+        """Predict the motion one button press starts, or None if unknowable.
+
+        Observed: CLOSED -> OPENING, OPEN -> CLOSING, a moving door stops, and
+        from STOPPED the door reverses its last direction of travel.
+        """
+        device = self._devices.get(device_id)
+        if device is None:
+            return None
+        state = device.door_state
+        if state is DoorState.CLOSED:
+            return DoorState.OPENING
+        if state is DoorState.OPEN:
+            return DoorState.CLOSING
+        if state is DoorState.STOPPED:
+            if device.last_motion is DoorState.OPENING:
+                return DoorState.CLOSING
+            if device.last_motion is DoorState.CLOSING:
+                return DoorState.OPENING
+        return None
+
+    async def _async_move(self, device_id: str, target: DoorState) -> None:
+        device = self._devices.get(device_id)
+        state = device.door_state if device else DoorState.UNKNOWN
+        done = (
+            (DoorState.OPEN, DoorState.OPENING)
+            if target is DoorState.OPENING
+            else (DoorState.CLOSED, DoorState.CLOSING)
+        )
+        if state in done:
+            return
+        if self.press_would_move(device_id) is target:
+            await self.async_press_button(device_id)
+            return
+        # A press would stop or reverse the door the wrong way. Never guess
+        # with a garage door: the caller can stop it first and retry.
+        raise OrbitCommandError(
+            f"a button press would not {'open' if target is DoorState.OPENING else 'close'}"
+            f" the door from its current state ({state.value})"
+        )
+
+    async def async_open_door(self, device_id: str) -> None:
+        """Open the door; no-op if already open/opening."""
+        await self._async_move(device_id, DoorState.OPENING)
+
+    async def async_close_door(self, device_id: str) -> None:
+        """Close the door; no-op if already closed/closing."""
+        await self._async_move(device_id, DoorState.CLOSING)
+
+    async def async_stop_door(self, device_id: str) -> None:
+        """Stop a moving door; no-op otherwise."""
+        device = self._devices.get(device_id)
+        if device and device.door_state in (DoorState.OPENING, DoorState.CLOSING):
+            await self.async_press_button(device_id)
+
+    async def async_set_light(self, device_id: str, on: bool) -> None:
+        """Turn the opener light on/off (state is not reported by the hub)."""
+        await self.async_send_ctrl(
+            device_id, const.CTRL_LIGHT_ON if on else const.CTRL_LIGHT_OFF
+        )

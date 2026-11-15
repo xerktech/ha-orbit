@@ -1,136 +1,195 @@
-"""Realtime transport for Orbit status pushes.
+"""MQTT transport for the Orbit cloud.
 
-The realtime channel is optional. It is abstracted behind
-:class:`RealtimeTransport` so that:
-
-* tests can inject a fake that replays canned messages, and
-* the heavy ``paho-mqtt`` dependency is imported lazily (only when a real
-  connection is actually opened), keeping the pure-Python client importable in
-  environments without it.
+Abstracted behind :class:`MqttTransport` so tests can inject a fake broker, and
+so the ``paho-mqtt`` import stays lazy.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from collections.abc import Awaitable, Callable
+import random
+import ssl
+from collections.abc import Callable
 from typing import Protocol
 
 from . import const
-from .models import OrbitDevice
+from .exceptions import OrbitAuthError, OrbitCannotConnect
 
 _LOGGER = logging.getLogger(__name__)
 
-DeviceHandler = Callable[[OrbitDevice], Awaitable[None]]
+#: Called on the event loop for every inbound message.
+MessageHandler = Callable[[str, bytes], None]
+#: Called on the event loop after every (re)connect.
+ConnectHandler = Callable[[], None]
 
 
-class RealtimeTransport(Protocol):
-    """Minimal interface the client needs from a realtime transport."""
+class MqttTransport(Protocol):
+    """What :class:`~orbitclient.client.OrbitClient` needs from MQTT."""
+
+    @property
+    def is_connected(self) -> bool: ...
 
     async def async_connect(
-        self, *, user_id: str, on_device: DeviceHandler
+        self,
+        *,
+        username: str,
+        password: str,
+        topics: list[str],
+        on_message: MessageHandler,
+        on_connect: ConnectHandler,
     ) -> None: ...
+
+    async def async_publish(self, topic: str, payload: str) -> None: ...
 
     async def async_disconnect(self) -> None: ...
 
 
-def build_default_transport(
-    *,
-    host: str,
-    port: int,
-    tls: bool,
-    username: str,
-    password: str,
-) -> RealtimeTransport:
-    """Factory for the production (paho-mqtt) transport."""
-    return PahoMqttTransport(
-        host=host, port=port, tls=tls, username=username, password=password
-    )
+def build_default_transport() -> MqttTransport:
+    return PahoMqttTransport()
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """TLS context trusting only the bundled chain (blocking: reads a file)."""
+    ctx = ssl.create_default_context(cafile=str(const.CA_BUNDLE))
+    return ctx
 
 
 class PahoMqttTransport:
-    """Realtime transport backed by ``paho-mqtt`` (Home Assistant bundles it).
+    """Transport backed by ``paho-mqtt`` 2.x (bundled with Home Assistant).
 
-    ``paho-mqtt`` runs its network loop on a background thread and delivers
-    messages via callbacks. We bounce those onto the event loop with
-    :meth:`asyncio.loop.call_soon_threadsafe` so ``on_device`` runs as a normal
-    coroutine on the loop that created this transport.
+    paho runs its network loop on its own thread; every callback is bounced
+    onto the asyncio loop with ``call_soon_threadsafe``. paho handles
+    reconnects itself; topics are re-subscribed on each connect.
     """
 
     def __init__(
-        self,
-        *,
-        host: str,
-        port: int,
-        tls: bool,
-        username: str,
-        password: str,
+        self, *, host: str = const.MQTT_HOST, port: int = const.MQTT_PORT
     ) -> None:
         self._host = host
         self._port = port
-        self._tls = tls
-        self._username = username
-        self._password = password
         self._client = None  # type: ignore[var-annotated]
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._on_device: DeviceHandler | None = None
-        self._user_id: str | None = None
+        self._topics: list[str] = []
+        self._on_message: MessageHandler | None = None
+        self._on_connect: ConnectHandler | None = None
+        self._first_connect: asyncio.Future[None] | None = None
+        self._connected = False
 
-    async def async_connect(self, *, user_id: str, on_device: DeviceHandler) -> None:
-        # Imported here so the client stays importable without paho installed.
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def async_connect(
+        self,
+        *,
+        username: str,
+        password: str,
+        topics: list[str],
+        on_message: MessageHandler,
+        on_connect: ConnectHandler,
+    ) -> None:
         import paho.mqtt.client as mqtt  # noqa: PLC0415
 
-        self._loop = asyncio.get_running_loop()
-        self._on_device = on_device
-        self._user_id = user_id
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._topics = topics
+        self._on_message = on_message
+        self._on_connect = on_connect
+        self._first_connect = loop.create_future()
 
-        client = mqtt.Client()
-        client.username_pw_set(self._username, self._password)
-        if self._tls:
-            client.tls_set()
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
+        ssl_ctx = await loop.run_in_executor(None, _build_ssl_context)
+
+        # The app uses "<acc_no><0-998>"; the broker may key ACLs on the prefix.
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"{username}{random.randint(0, 998)}",
+            clean_session=True,
+        )
+        client.username_pw_set(username, password)
+        client.tls_set_context(ssl_ctx)
+        client.reconnect_delay_set(min_delay=2, max_delay=120)
+        client.on_connect = self._paho_on_connect
+        client.on_disconnect = self._paho_on_disconnect
+        client.on_message = self._paho_on_message
         self._client = client
 
-        await self._loop.run_in_executor(
-            None, client.connect, self._host, self._port, 60
-        )
+        try:
+            await loop.run_in_executor(
+                None, client.connect, self._host, self._port, const.MQTT_KEEPALIVE
+            )
+        except OSError as err:
+            raise OrbitCannotConnect(f"MQTT connect failed: {err}") from err
         client.loop_start()
-        _LOGGER.debug("MQTT realtime connected to %s:%s", self._host, self._port)
+
+        try:
+            async with asyncio.timeout(const.DEFAULT_TIMEOUT):
+                await self._first_connect
+        except TimeoutError as err:
+            await self.async_disconnect()
+            raise OrbitCannotConnect("MQTT broker did not acknowledge connect") from err
+        except OrbitAuthError:
+            await self.async_disconnect()
+            raise
+
+    async def async_publish(self, topic: str, payload: str) -> None:
+        client = self._client
+        if client is None or not self._connected:
+            raise OrbitCannotConnect("MQTT not connected")
+        info = client.publish(topic, payload, qos=0)
+        if info.rc != 0:
+            raise OrbitCannotConnect(f"MQTT publish failed (rc={info.rc})")
 
     async def async_disconnect(self) -> None:
         client = self._client
         if client is None:
             return
         self._client = None
-        await asyncio.get_running_loop().run_in_executor(None, client.loop_stop)
+        self._connected = False
         client.disconnect()
+        await asyncio.get_running_loop().run_in_executor(None, client.loop_stop)
 
     # ---- paho thread callbacks -------------------------------------------
 
-    def _on_connect(self, client, _userdata, _flags, _rc) -> None:  # noqa: ANN001
-        topic = const.TOPIC_STATUS.format(user_id=self._user_id, device_id="+")
-        client.subscribe(topic)
-        _LOGGER.debug("Subscribed to %s", topic)
+    def _paho_on_connect(self, client, _userdata, _flags, reason_code, _props=None):  # noqa: ANN001
+        if reason_code.is_failure:
+            _LOGGER.warning("Orbit MQTT connect refused: %s", reason_code)
+            # paho would retry forever with bad credentials; stop it.
+            if str(reason_code) in ("Bad user name or password", "Not authorized"):
+                client.disconnect()
+                self._resolve_first(
+                    OrbitAuthError(f"MQTT login refused: {reason_code}")
+                )
+            else:
+                self._resolve_first(OrbitCannotConnect(f"MQTT refused: {reason_code}"))
+            return
+        for topic in self._topics:
+            client.subscribe(topic, qos=1)
+        self._connected = True
+        _LOGGER.debug("Orbit MQTT connected; subscribed to %s", self._topics)
+        self._resolve_first(None)
+        if self._loop and self._on_connect:
+            self._loop.call_soon_threadsafe(self._on_connect)
 
-    def _on_message(self, _client, _userdata, msg) -> None:  # noqa: ANN001
-        try:
-            payload = json.loads(msg.payload)
-        except (ValueError, TypeError):
-            _LOGGER.debug("Ignoring non-JSON MQTT payload on %s", msg.topic)
-            return
-        if not isinstance(payload, dict):
-            return
-        try:
-            device = OrbitDevice.from_dict(payload)
-        except (KeyError, TypeError):
-            _LOGGER.debug("Ignoring MQTT payload without a device id")
+    def _paho_on_disconnect(self, _client, _userdata, _flags, reason_code, _props=None):  # noqa: ANN001
+        self._connected = False
+        _LOGGER.debug("Orbit MQTT disconnected: %s", reason_code)
+
+    def _paho_on_message(self, _client, _userdata, msg) -> None:  # noqa: ANN001
+        if self._loop and self._on_message:
+            self._loop.call_soon_threadsafe(self._on_message, msg.topic, msg.payload)
+
+    def _resolve_first(self, error: Exception | None) -> None:
+        fut, loop = self._first_connect, self._loop
+        if fut is None or loop is None:
             return
 
-        loop = self._loop
-        handler = self._on_device
-        if loop is None or handler is None:
-            return
-        # Hop from the paho network thread back onto the event loop.
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(handler(device)))
+        def _set() -> None:
+            if fut.done():
+                return
+            if error is None:
+                fut.set_result(None)
+            else:
+                fut.set_exception(error)
+
+        loop.call_soon_threadsafe(_set)

@@ -1,4 +1,4 @@
-"""Binary sensors for Orbit devices (obstruction, connectivity)."""
+"""Binary sensors for Orbit hubs (connectivity, door sensor, auto-close)."""
 
 from __future__ import annotations
 
@@ -10,37 +10,55 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import OrbitConfigEntry, OrbitDataUpdateCoordinator
-from .entity import OrbitEntity
-from .orbitclient import OrbitDevice
+from .entity import OrbitEntity, async_add_entities_when_present
+from .orbitclient import DoorSensorStatus, OrbitDevice
 
 
 @dataclass(frozen=True, kw_only=True)
 class OrbitBinarySensorDescription(BinarySensorEntityDescription):
-    """Describes an Orbit binary sensor and how to read it from a device."""
-
     value_fn: Callable[[OrbitDevice], bool | None]
-    # Only create the entity when the device actually reports this attribute.
     exists_fn: Callable[[OrbitDevice], bool]
+
+
+def _has_door_sensor(d: OrbitDevice) -> bool:
+    return d.door_sensor not in (None, DoorSensorStatus.NOT_INSTALLED)
 
 
 SENSORS: tuple[OrbitBinarySensorDescription, ...] = (
     OrbitBinarySensorDescription(
-        key="obstruction",
-        translation_key="obstruction",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda d: d.obstructed,
-        exists_fn=lambda d: d.obstructed is not None,
-    ),
-    OrbitBinarySensorDescription(
         key="connectivity",
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda d: d.online,
         exists_fn=lambda _d: True,
+    ),
+    OrbitBinarySensorDescription(
+        key="autoclose",
+        translation_key="autoclose",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.autoclose_enabled,
+        exists_fn=lambda d: d.autoclose_enabled is not None,
+    ),
+    OrbitBinarySensorDescription(
+        key="door_sensor_battery",
+        translation_key="door_sensor_battery",
+        device_class=BinarySensorDeviceClass.BATTERY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.door_sensor is DoorSensorStatus.LOW_BATTERY,
+        exists_fn=_has_door_sensor,
+    ),
+    OrbitBinarySensorDescription(
+        key="door_sensor_problem",
+        translation_key="door_sensor_problem",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.door_sensor is DoorSensorStatus.LOST,
+        exists_fn=_has_door_sensor,
     ),
 )
 
@@ -50,18 +68,12 @@ async def async_setup_entry(
     entry: OrbitConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coordinator = entry.runtime_data
-    async_add_entities(
-        OrbitBinarySensor(coordinator, device_id, description)
-        for device_id, device in coordinator.data.items()
-        for description in SENSORS
-        if description.exists_fn(device)
+    async_add_entities_when_present(
+        entry, async_add_entities, SENSORS, OrbitBinarySensor
     )
 
 
 class OrbitBinarySensor(OrbitEntity, BinarySensorEntity):
-    """A binary sensor derived from a device attribute."""
-
     entity_description: OrbitBinarySensorDescription
 
     def __init__(
@@ -76,7 +88,7 @@ class OrbitBinarySensor(OrbitEntity, BinarySensorEntity):
 
     @property
     def available(self) -> bool:
-        # The connectivity sensor must stay available to report "off".
+        # Connectivity must stay available to report "disconnected".
         if self.entity_description.key == "connectivity":
             return self.coordinator.last_update_success and self.device is not None
         return super().available
@@ -84,6 +96,4 @@ class OrbitBinarySensor(OrbitEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool | None:
         device = self.device
-        if device is None:
-            return None
-        return self.entity_description.value_fn(device)
+        return None if device is None else self.entity_description.value_fn(device)

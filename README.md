@@ -1,47 +1,57 @@
 # ha-orbit — Skylink Orbit garage door openers for Home Assistant
 
-A [HACS](https://hacs.xyz/) custom integration for **Skylink Orbit** Wi‑Fi garage
-door openers — the **Atoms**, **Atoms Pro**, and **Nova** controllers driven by
-the **Orbit Home** app (`com.mtqqdemo.skylink`).
+A custom Home Assistant integration (installable through the Marketplace, formerly
+HACS) for **Skylink Orbit** Wi‑Fi garage door openers controlled by the
+**Orbit Home** app (`com.mtqqdemo.skylink`).
 
-> **Not** the same as `bhyve-home-assistant`, which is for *Orbit Irrigation's*
-> B‑hyve sprinklers — a different company that happens to share the name "Orbit".
+Forked from [xerktech/ha-orbit](https://github.com/xerktech/ha-orbit), whose
+integration scaffold used placeholder endpoints; this fork implements the real
+protocol.
+
+> **Not** the same as `bhyve-home-assistant` / `com.orbit.orbitsmarthome`, which
+> are *Orbit Irrigation's* B‑hyve sprinklers — a different company that happens
+> to share the name "Orbit".
 
 ## Status
 
-⚠️ **Protocol not yet confirmed against hardware.** Skylink publishes no API. The
-cloud request/response shapes here are a structured best guess (see
-[`SPEC.md`](SPEC.md)); the code is arranged so that wiring in a real, captured
-protocol is a localized edit to `orbitclient/const.py` and two parse helpers in
-`orbitclient/models.py`. Everything else — auth lifecycle, coordinator, entities,
-config/reauth/options flows, and the test suite — is complete and green.
+✅ **Working against real hardware** (Skylink `GDO` hubs, firmware
+`WF2012021040204`). The protocol was recovered from the Orbit Home Android app
+and verified live:
 
-If you own one of these openers and can run a `mitmproxy` capture, see
-[`SPEC.md` §2.1](SPEC.md#21-how-to-capture-the-protocol) — that's the one missing
-piece.
+* **Login** — signed REST call to `iot.skyhm.net:8444` (`cmd=act_login`).
+* **Everything else** — MQTT over TLS to `iot.skyhm.net:1899`: device list,
+  real‑time state pushes (≈1 s), and commands.
+
+Details are in [`orbitclient/const.py`](custom_components/orbit_gdo/orbitclient/const.py).
+Nova (`NOVA_A`/`NOVA_B`/`NVMini`) controllers are not yet supported.
 
 ## What you get
 
-| Entity           | Description                                    |
-| ---------------- | ---------------------------------------------- |
-| Cover (`garage`) | Open / close / stop the door, live door state  |
-| Light            | The opener's built‑in light (if present)       |
-| Binary sensor    | Obstruction (`problem`), connectivity          |
-| Sensor           | Wi‑Fi signal, battery (diagnostic)             |
+| Entity                     | Description                                                       |
+| -------------------------- | ----------------------------------------------------------------- |
+| Cover (`garage`)           | Open / close / stop, live state incl. opening/closing/part‑open   |
+| Light                      | Opener light on/off (assumed state: the hub does not report it)   |
+| Button "Door button"       | Raw wall‑button press (disabled by default)                       |
+| Binary sensor              | Connectivity, auto‑close, door‑sensor battery/problem (diagnostic) |
+| Sensor                     | Wi‑Fi signal (diagnostic, disabled by default)                    |
 
-State is polled every 30 s, with an optional MQTT push channel for near‑instant
-updates that falls back to polling if the broker is unreachable.
+### How open / close work
 
-## Installation (HACS)
+The opener only accepts a single "button press" that cycles
+*open → stop → close → stop → …*. The cover maps open/close/stop onto it using
+the live state and the last direction of travel, and is idempotent (closing a
+closed door does nothing). If a press would move the door the wrong way (e.g.
+"close" while it is opening, or a part‑open door whose direction is unknown
+after a restart), the command is refused instead of guessed — press **stop**
+first, or use the **Door button** entity.
 
-1. HACS → ⋮ → **Custom repositories** → add `https://github.com/xerhab/ha-orbit`,
-   category **Integration**.
+## Installation (Marketplace)
+
+1. In the Marketplace, add `https://github.com/joesilva101/ha-orbit` as a
+   **custom repository**, category **Integration**.
 2. Install **Orbit Garage Door Opener (Skylink)**, then restart Home Assistant.
 3. **Settings → Devices & Services → Add Integration → Orbit** and sign in with
-   your Orbit Home account.
-
-Advanced fields let you override the API base URL and MQTT host — use these to
-point at a captured host without editing source.
+   your Orbit Home account (same email/password as the phone app).
 
 ## Manual installation
 
@@ -51,13 +61,14 @@ directory and restart.
 ## Development
 
 ```bash
-uv sync --group dev        # or: pip install -e '.[dev]'
+uv sync --group dev
 uv run ruff check .
 uv run pytest
 ```
 
 The `orbitclient/` package under `custom_components/orbit_gdo/` has **no Home
-Assistant dependency** and is unit‑tested standalone with `aioresponses`.
+Assistant dependency** and is unit‑tested standalone (REST via `aioresponses`,
+MQTT via a fake transport, fixtures taken from real hub traffic).
 
 ## License
 

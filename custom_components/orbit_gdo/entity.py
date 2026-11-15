@@ -2,12 +2,50 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from typing import Any
+
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
-from .coordinator import OrbitDataUpdateCoordinator
+from .coordinator import OrbitConfigEntry, OrbitDataUpdateCoordinator
 from .orbitclient import OrbitDevice
+
+
+def async_add_entities_when_present(
+    entry: OrbitConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+    descriptions: Iterable[Any],
+    factory: Callable[[OrbitDataUpdateCoordinator, str, Any], Entity],
+) -> None:
+    """Add one entity per (device, description) once ``exists_fn`` is true.
+
+    Checked at setup and again on every coordinator update, so an entity whose
+    field a hub only starts reporting later (e.g. auto-close, a newly paired
+    door sensor, a new hub on the account) appears without a reload.
+    """
+    coordinator = entry.runtime_data
+    descriptions = tuple(descriptions)
+    added: set[tuple[str, str]] = set()
+
+    @callback
+    def _check() -> None:
+        new: list[Entity] = []
+        for device_id, device in (coordinator.data or {}).items():
+            for description in descriptions:
+                key = (device_id, description.key)
+                if key not in added and description.exists_fn(device):
+                    added.add(key)
+                    new.append(factory(coordinator, device_id, description))
+        if new:
+            async_add_entities(new)
+
+    _check()
+    entry.async_on_unload(coordinator.async_add_listener(_check))
 
 
 class OrbitEntity(CoordinatorEntity[OrbitDataUpdateCoordinator]):
