@@ -1,4 +1,4 @@
-"""Diagnostic sensors for Orbit devices (Wi-Fi signal, battery)."""
+"""Diagnostic sensors for Orbit hubs (Wi-Fi signal)."""
 
 from __future__ import annotations
 
@@ -11,16 +11,12 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import (
-    PERCENTAGE,
-    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
-    EntityCategory,
-)
+from homeassistant.const import SIGNAL_STRENGTH_DECIBELS_MILLIWATT, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import OrbitConfigEntry, OrbitDataUpdateCoordinator
-from .entity import OrbitEntity
+from .entity import OrbitEntity, async_add_entities_when_present
 from .orbitclient import OrbitDevice
 
 
@@ -43,15 +39,6 @@ SENSORS: tuple[OrbitSensorDescription, ...] = (
         value_fn=lambda d: d.wifi_rssi,
         exists_fn=lambda d: d.wifi_rssi is not None,
     ),
-    OrbitSensorDescription(
-        key="battery",
-        device_class=SensorDeviceClass.BATTERY,
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda d: d.battery_level,
-        exists_fn=lambda d: d.battery_level is not None,
-    ),
 )
 
 
@@ -60,13 +47,7 @@ async def async_setup_entry(
     entry: OrbitConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coordinator = entry.runtime_data
-    async_add_entities(
-        OrbitSensor(coordinator, device_id, description)
-        for device_id, device in coordinator.data.items()
-        for description in SENSORS
-        if description.exists_fn(device)
-    )
+    async_add_entities_when_present(entry, async_add_entities, SENSORS, OrbitSensor)
 
 
 class OrbitSensor(OrbitEntity, SensorEntity):

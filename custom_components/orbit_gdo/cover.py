@@ -10,14 +10,13 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import OrbitConfigEntry, OrbitDataUpdateCoordinator
 from .entity import OrbitEntity
-from .orbitclient import DoorState
-from .orbitclient.exceptions import OrbitError
+from .orbitclient import DoorState, OrbitError
 
-# Commands are serialized by HA per-entity anyway; a door has one motor.
 PARALLEL_UPDATES = 1
 
 
@@ -26,7 +25,7 @@ async def async_setup_entry(
     entry: OrbitConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up one cover per Orbit device."""
+    """Set up one cover per Orbit hub."""
     coordinator = entry.runtime_data
     async_add_entities(
         OrbitCover(coordinator, device_id) for device_id in coordinator.data
@@ -34,7 +33,12 @@ async def async_setup_entry(
 
 
 class OrbitCover(OrbitEntity, CoverEntity):
-    """A single Orbit garage door."""
+    """A single Orbit garage door.
+
+    The hardware only has a toggle "button press"; open/close/stop are mapped
+    onto it using the reported state and last direction of travel, and refuse
+    rather than guess when a press would move the door the wrong way.
+    """
 
     _attr_device_class = CoverDeviceClass.GARAGE
     _attr_supported_features = (
@@ -61,6 +65,13 @@ class OrbitCover(OrbitEntity, CoverEntity):
     def is_closing(self) -> bool:
         return bool(self.device and self.device.door_state is DoorState.CLOSING)
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        device = self.device
+        if device is None:
+            return None
+        return {"partially_open": device.door_state is DoorState.STOPPED}
+
     async def async_open_cover(self, **kwargs: Any) -> None:
         await self._command(self.coordinator.client.async_open_door)
 
@@ -71,11 +82,8 @@ class OrbitCover(OrbitEntity, CoverEntity):
         await self._command(self.coordinator.client.async_stop_door)
 
     async def _command(self, func) -> None:
-        from homeassistant.exceptions import HomeAssistantError
-
         try:
             await func(self._device_id)
         except OrbitError as err:
-            raise HomeAssistantError(f"Orbit command failed: {err}") from err
-        # Optimistically ask for a fresh state; realtime push may beat it.
-        await self.coordinator.async_request_refresh()
+            raise HomeAssistantError(f"Orbit: {err}") from err
+        # No refresh needed: the hub pushes state changes within ~1s.

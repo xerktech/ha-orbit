@@ -1,5 +1,10 @@
 # Orbit Garage Door Opener — Home Assistant integration spec
 
+> **Historical.** This is the original design spec, written before the protocol
+> was known; its endpoint/host assumptions (`api.orbit.skylinkhome.com`,
+> `/v1/...`) were placeholders. The real, hardware‑verified protocol is
+> documented in [`orbitclient/const.py`](custom_components/orbit_gdo/orbitclient/const.py).
+
 ## 1. Problem & scope
 
 Skylink sells Wi‑Fi garage door openers — the **Atoms**, **Atoms Pro**, and the

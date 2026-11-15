@@ -3,12 +3,10 @@
     "step": {
       "user": {
         "title": "Orbit Garage Door Opener",
-        "description": "Sign in with your Skylink Orbit Home account.",
+        "description": "Sign in with your Skylink Orbit Home app account.",
         "data": {
           "email": "Email",
-          "password": "Password",
-          "base_url": "API base URL (advanced)",
-          "mqtt_host": "Realtime MQTT host (advanced)"
+          "password": "Password"
         }
       },
       "reauth_confirm": {
@@ -27,31 +25,30 @@
     },
     "abort": {
       "already_configured": "This Orbit account is already configured.",
-      "reauth_successful": "Re-authentication was successful."
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Orbit options",
-        "data": {
-          "enable_realtime": "Enable realtime push updates (MQTT)"
-        },
-        "data_description": {
-          "enable_realtime": "When off, state is refreshed by polling only."
-        }
-      }
+      "reauth_successful": "Re-authentication was successful.",
+      "wrong_account": "These credentials belong to a different Orbit account."
     }
   },
   "entity": {
-    "light": {
-      "opener_light": {
-        "name": "Opener light"
+    "button": {
+      "door_button": {
+        "name": "Door button"
       }
     },
     "binary_sensor": {
-      "obstruction": {
-        "name": "Obstruction"
+      "autoclose": {
+        "name": "Auto-close active"
+      },
+      "door_sensor_battery": {
+        "name": "Door sensor battery"
+      },
+      "door_sensor_problem": {
+        "name": "Door sensor"
+      }
+    },
+    "light": {
+      "opener_light": {
+        "name": "Light"
       }
     }
   }
