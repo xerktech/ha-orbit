@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Allow running CI by hand from the Actions tab (e.g. after enabling
+  # Actions on a fork, when no push has happened yet).
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
